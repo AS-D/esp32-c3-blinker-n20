@@ -15,11 +15,13 @@
  *  4. 配网信息保存在设备 EEPROM 中，之后换网也走同样的 APP 配网流程
  *  5. 长按 BOOT 键 3 秒 = 清除 WiFi 配置（Blinker.reset()）并重启重新配网
  *
- * 【LED 颜色含义（板载 WS2812 RGB，GPIO8）】
- *   🟡 黄色呼吸  = 配网模式（热点已开启，等待 APP 配网）
- *   🔵 蓝色慢闪  = 已配网，正在连接 WiFi / Blinker
- *   🟢 绿色常亮  = 已连接 WiFi 并连上 Blinker，正常工作
- *   🟣 紫色闪烁  = WiFi 连上但 Blinker 离线（检查密钥或网络）
+ * 【板载 LED（GPIO8）】
+ *   本板 ESP32-C3 SuperMini 的板载 LED 是【单色蓝色 LED】（2 脚），
+ *   只能用亮度/闪烁节奏表达状态，无法显示颜色：
+ *     呼吸        = 配网模式 / 未连上 WiFi（热点已开启，等待 APP 配网）
+ *     慢闪        = WiFi 已连上，但 Blinker 未上线（检查密钥或网络）
+ *     常亮（暗）  = 已连接 WiFi 并连上 Blinker，正常工作
+ *     快闪        = 长按 BOOT 触发清除配网配置
  *
  * 【安全】
  *   - 上电默认停电机
@@ -35,8 +37,7 @@
 // ============ 引脚定义 ============
 #define MOTOR_PIN       6       // MOS 管 IN 脚
 #define BOOT_BTN_PIN    9       // SuperMini BOOT 按键（GPIO9）
-#define LED_PIN         8       // SuperMini 板载 WS2812 数据脚
-// 注：板载 LED 不在 GPIO8 时改成实际引脚；不接 LED 可注释掉这行
+#define LED_PIN         8       // SuperMini 板载单色蓝灯（GPIO8）
 
 // ============ Blinker 设备密钥（必填）============
 // 点灯科技 APP -> 设备 -> 设备密钥，12 位
@@ -51,43 +52,63 @@ bool apEnabled() {
   return m == WIFI_MODE_AP || m == WIFI_MODE_APSTA;
 }
 
-// ============ LED 控制 ============
-// ESP32 Arduino 核心自带 neopixelWrite()，基于 RMT 硬件发送，占用时间极短，
-// 不会像软件延时驱动那样长时间关闭中断（那样会卡死 WiFi/AP，导致热点扫不到）
-void setLED(uint8_t r, uint8_t g, uint8_t b) {
-#ifdef LED_PIN
-  neopixelWrite(LED_PIN, r, g, b);
+// ============ LED 控制（板载单色蓝灯）============
+// SuperMini 板载 LED 接 GPIO8，是 2 脚单色蓝灯，只能用 LEDC(PWM) 调亮度/闪烁，
+// 无法显示颜色，用不同节奏/亮度表达状态。
+#define LED_PWM_CH     0
+#define LED_PWM_FREQ   5000
+#define LED_PWM_RES    8
+
+// 多数 SuperMini 是「GPIO 高电平点亮」；若发现亮灭相反，改成 1
+#define LED_ACTIVE_LOW 0
+
+void ledInit() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(LED_PIN, LED_PWM_FREQ, LED_PWM_RES);     // Arduino core 3.x
+#else
+  ledcSetup(LED_PWM_CH, LED_PWM_FREQ, LED_PWM_RES);    // Arduino core 2.x
+  ledcAttachPin(LED_PIN, LED_PWM_CH);
 #endif
 }
 
-// 根据当前状态刷新板载 RGB，非阻塞
+// level: 0(灭) ~ 255(最亮)
+void setLED(uint8_t level) {
+#if LED_ACTIVE_LOW
+  level = 255 - level;
+#endif
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(LED_PIN, level);
+#else
+  ledcWrite(LED_PWM_CH, level);
+#endif
+}
+
+// 根据当前状态刷新板载 LED，非阻塞
 void updateLED() {
-#ifdef LED_PIN
   static uint32_t lastTick = 0;
   static int16_t  breath   = 0;
-  static int16_t  step     = 2;
+  static int16_t  step     = 3;
 
   uint32_t now = millis();
   if (now - lastTick < 25) return;
   lastTick = now;
 
   if (WiFi.status() != WL_CONNECTED) {
-    // 配网 / 未连上 WiFi：黄色呼吸
+    // 配网 / 未连上 WiFi：呼吸
     breath += step;
-    if (breath <= 0)       { breath = 0;  step = 2;  }
-    else if (breath >= 60) { breath = 60; step = -2; }
-    setLED(breath, breath * 2 / 3, 0);
+    if (breath <= 0)       { breath = 0;  step = 3;  }
+    else if (breath >= 90) { breath = 90; step = -3; }
+    setLED((uint8_t)breath);
   }
   else if (!Blinker.connected()) {
-    // WiFi 已连、Blinker 未连：蓝色慢闪
+    // WiFi 已连、Blinker 未连：慢闪
     bool on = (now / 400) % 2 == 0;
-    setLED(0, 0, on ? 60 : 0);
+    setLED(on ? 80 : 0);
   }
   else {
-    // 全部在线：绿色常亮（亮度压低，减少发热与干扰）
-    setLED(0, 40, 0);
+    // 全部在线：常亮（亮度压低，减少发热与干扰，与呼吸/闪烁可区分）
+    setLED(35);
   }
-#endif
 }
 
 // ============ 电机控制 ============
@@ -132,8 +153,8 @@ void handleResetButton() {
     BLINKER_LOG("长按 BOOT：清除 WiFi 配置并重启");
     motorStop();
     for (int i = 0; i < 5; i++) {
-      setLED(60, 20, 0); delay(90);
-      setLED(0, 0, 0);   delay(90);
+      setLED(60); delay(90);
+      setLED(0);  delay(90);
     }
     Blinker.reset();   // 擦除配网标记后内部直接重启
   }
@@ -198,9 +219,8 @@ void setup() {
 
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
-#ifdef LED_PIN
-  setLED(0, 0, 0);      // 上电先灭灯
-#endif
+  ledInit();            // 初始化板载 LED 的 PWM 通道
+  setLED(0);            // 上电先灭灯
 
   if (strlen(auth) != 12) {
     Serial.printf("[WARN] auth 长度 %d，Blinker 密钥应为 12 位，请先填写正确的 key\n", strlen(auth));
