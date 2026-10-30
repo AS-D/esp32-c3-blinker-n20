@@ -32,6 +32,12 @@
  *     常亮（暗）  = 已连接 WiFi 并连上 Blinker，正常工作
  *     快闪        = 长按 BOOT 触发清除配网配置
  *
+ * 【DHT11 数字温湿度模块（GPIO4）】
+ *   模块三线接法：VCC -> 3V3，DATA -> GPIO4，GND -> GND
+ *   模块板载 10k 上拉；若用四脚裸传感器，需在 DATA 与 3V3 之间外接 10kΩ 上拉
+ *   每 2 秒采样一次（DHT11 采样周期必须 >= 1s，读太快会返回错误数据）
+ *   温度/湿度用 APP 端「数显」组件显示，键名 temp / humi
+ *
  * 【安全】
  *   - 上电默认停电机
  *   - Blinker 掉线超过 3 秒自动停电机
@@ -45,11 +51,13 @@
 #include <Preferences.h>
 #include <nvs.h>
 #include <Blinker.h>
+#include <DHT.h>          // Adafruit DHT 库（DHT11 温湿度）
 
 // ============ 引脚定义 ============
 #define MOTOR_PIN       6       // MOS 管 IN 脚
 #define BOOT_BTN_PIN    9       // SuperMini BOOT 按键（GPIO9）
 #define LED_PIN         8       // SuperMini 板载单色蓝灯（GPIO8）
+#define DHT_PIN         4       // DHT11 数字温湿度模块 DATA 脚（GPIO4）
 
 // ============ Blinker 设备密钥（必填）============
 // 点灯科技 APP -> 设备 -> 设备密钥，12 位
@@ -242,6 +250,57 @@ void motorCallback(const String & state) {
   }
 }
 
+// ============ DHT11 温湿度传感器 ============
+// 使用 Adafruit DHT 库（platformio.ini 已加依赖）。
+// 注意：DHT11 两次采样间隔必须 >= 1s，这里固定 2s 读一次。
+#define DHTTYPE DHT11
+DHT dht(DHT_PIN, DHTTYPE);
+
+// APP 端需添加两个「数显」组件，键名与下面保持一致：
+//   温度组件：temp    湿度组件：humi
+BlinkerNumber NumTemp("temp");
+BlinkerNumber NumHumi("humi");
+
+float g_temp = NAN;   // 最近一次成功读取的温度
+float g_humi = NAN;   // 最近一次成功读取的湿度
+
+// Blinker 心跳回调：周期性把最新温湿度刷新到 APP（约 30s 一次）
+void heartbeat() {
+  if (!isnan(g_temp)) NumTemp.print(g_temp);
+  if (!isnan(g_humi)) NumHumi.print(g_humi);
+}
+
+// 非阻塞读取 DHT11：每 2s 采样一次；
+// 数值有变化时立即推送 APP，没变化就等心跳刷新，减少 MQTT 流量
+void dhtRead() {
+  static uint32_t lastRead = 0;
+  static float    lastT = NAN, lastH = NAN;
+
+  if (millis() - lastRead < 2000) return;
+  lastRead = millis();
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(h) || isnan(t)) {
+    Serial.println("[DHT] 读取失败：检查接线 VCC->3V3 / DATA->GPIO4 / GND->GND，裸传感器需 10k 上拉");
+    return;
+  }
+
+  g_temp = t;
+  g_humi = h;
+  Serial.printf("[DHT] 温度=%.1f°C  湿度=%.1f%%\n", t, h);
+
+  if (t != lastT || h != lastH) {
+    if (Blinker.connected()) {
+      NumTemp.print(t);
+      NumHumi.print(h);
+    }
+    lastT = t;
+    lastH = h;
+  }
+}
+
 // ============ 长按 BOOT 清除 WiFi 配置（非阻塞）============
 void handleResetButton() {
   static bool     pressed    = false;
@@ -281,8 +340,8 @@ void printStatus() {
   if (millis() - lastPrint < 5000) return;
   lastPrint = millis();
 
-  Serial.printf("[STA] millis=%lu wifiMode=%d staStatus=%d blinker=%s ",
-                (unsigned long)millis(), WiFi.getMode(), WiFi.status(),
+  Serial.printf("[STA] millis=%lu wifiMode=%d staStatus=%d wifiRssi=%d blinker=%s ",
+                (unsigned long)millis(), WiFi.getMode(), WiFi.status(), WiFi.RSSI(),
                 Blinker.connected() ? "在线" : "离线");
 
   if (apEnabled()) {
@@ -385,6 +444,8 @@ void setup() {
   ledInit();            // 初始化板载 LED 的 PWM 通道
   setLED(0);            // 上电先灭灯
 
+  dht.begin();          // DHT11 初始化（DATA=GPIO4）
+
   if (strlen(auth) != 12) {
     Serial.printf("[WARN] auth 长度 %d，Blinker 密钥应为 12 位，请先填写正确的 key\n", strlen(auth));
   }
@@ -426,6 +487,7 @@ void setup() {
   Blinker.begin(auth);
 
   MotorBtn.attach(motorCallback);
+  Blinker.attachHeartbeat(heartbeat);   // 心跳把最新温湿度刷新到 APP
 
   if (apEnabled()) {
     // 明明有存档却还是开了热点 = Blinker 没读到 EEPROM（写入未落盘）
@@ -456,6 +518,7 @@ void loop() {
   Blinker.run();
 
   updateLED();
+  dhtRead();           // 每 2s 读一次 DHT11 温湿度
   handleResetButton();
   printStatus();
   captureWiFiConfig();   // WiFi 一连上就把凭据写入 NVS（断电不丢的关键）
